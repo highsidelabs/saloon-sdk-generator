@@ -101,7 +101,7 @@ class Schema extends Parameter
                 return false;
             }
 
-            $sameItems = $this->items->type === $other->items->title;
+            $sameItems = $this->items->type === ($other->items->title ?? $other->items->type ?? null);
             if (! $sameItems) {
                 return false;
             }

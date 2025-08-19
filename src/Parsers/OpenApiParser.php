@@ -109,10 +109,10 @@ class OpenApiParser implements Parser
     }
 
     /**
-     * @param  OpenApiSchema[]  $schemas
+     * @param  array<string, OpenApiSchema>  $schemas
      * @return Schema[]
      */
-    protected function parseSchemas(array $schemas, ?Schema &$parent = null): array
+    protected function parseSchemas(array $schemas, ?Schema &$parent = null, array $seen = []): array
     {
         $parsedSchemas = [];
         foreach ($schemas as $name => $schema) {
@@ -122,12 +122,49 @@ class OpenApiParser implements Parser
                 // to check that the parent's rawName (which would be a property name) matches the
                 // name of the schema we're currently iterating over
                 if ($_parent->rawName === $name && $_parent->equalsOpenApiSchema($schema)) {
+                    // Direct recursion: create a typed reference back to the ancestor instead of parsing again
+                    $parsedSchemas[$name] = new Schema(
+                        name: $_parent->name,
+                        rawName: $name,
+                        type: $_parent->type,
+                        description: $schema->description,
+                        nullable: (bool) ($schema->nullable ?? false),
+                        parent: $parent,
+                    );
                     continue 2;
                 }
                 $_parent = $_parent->parent;
             }
 
-            $parsed = $this->parseSchema($schema, $parent, $name);
+            // Short-circuit if we've already seen this schema in the current path
+            $schemaId = spl_object_id($schema);
+            if (in_array($schemaId, $seen, true)) {
+                // Array-item or indirect recursion: find the nearest non-array ancestor matching this schema
+                $ancestor = $parent;
+                while ($ancestor !== null) {
+                    if ($ancestor->type !== SimpleType::ARRAY->value && $ancestor->equalsOpenApiSchema($schema)) {
+                        $parsedSchemas[$name] = new Schema(
+                            name: $ancestor->name,
+                            rawName: $name,
+                            type: $ancestor->type,
+                            description: $schema->description,
+                            nullable: (bool) ($schema->nullable ?? false),
+                            parent: $parent,
+                        );
+                        break;
+                    }
+                    $ancestor = $ancestor->parent;
+                }
+                // If no ancestor matched, we skip to avoid infinite recursion
+                continue;
+            }
+
+            if (isset($parsedSchemas[$name])) {
+                continue;
+            }
+
+            $nextSeen = [...$seen, $schemaId];
+            $parsed = $this->parseSchema($schema, $parent, $name, $nextSeen);
             if ($parsed) {
                 $parsedSchemas[$name] = $parsed;
             }
@@ -139,18 +176,19 @@ class OpenApiParser implements Parser
     protected function parseSchema(
         OpenApiSchema $schema,
         ?Schema &$parent = null,
-        ?string $parentPropName = null
+        ?string $parentPropName = null,
+        array $seen = []
     ): Schema {
         // TODO: add support for anyOf and oneOf schemas
         if ($schema->allOf) {
-            $parsedSchema = $this->parseAllOfSchema($schema, $parent, $parentPropName);
+            $parsedSchema = $this->parseAllOfSchema($schema, $parent, $parentPropName, $seen);
         } elseif (Type::isScalar($schema->type)) {
             $parsedSchema = new Schema(
                 name: $schema->title ?? $parentPropName,
                 rawName: $parentPropName,
                 type: $this->mapSchemaTypeToPhpType($schema->type, $schema->format),
                 description: $schema->description,
-                nullable: $schema->required ?? $schema->nullable,
+                nullable: (bool) ($schema->required ?? $schema->nullable ?? false),
                 parent: $parent,
             );
         } elseif ($schema->type === Type::ARRAY) {
@@ -161,7 +199,7 @@ class OpenApiParser implements Parser
                 rawName: $parentPropName,
                 type: $this->mapSchemaTypeToPhpType($schema->type, $schema->format),
                 description: $schema->description,
-                nullable: $schema->required ?? $schema->nullable ?? false,
+                nullable: (bool) ($schema->required ?? $schema->nullable ?? false),
                 parent: $parent,
             );
 
@@ -172,7 +210,7 @@ class OpenApiParser implements Parser
                     name: $name,
                     type: $this->mapSchemaTypeToPhpType($schema->items->type, $schema->items->format),
                     description: $schema->description,
-                    nullable: $schema->required ?? $schema->nullable ?? false,
+                    nullable: (bool) ($schema->required ?? $schema->nullable ?? false),
                     parent: $parent,
                 );
             } else {
@@ -184,7 +222,11 @@ class OpenApiParser implements Parser
                     description: $schema->description,
                 );
                 $parsedSchema->items = $tempItemSchema;
-                $parsedSchema->items = $this->parseSchema($schema->items, $parsedSchema);
+                // Route through parseSchemas so cycle detection happens before object creation
+                $itemsParsed = $this->parseSchemas(['items' => $schema->items], $parsedSchema, $seen);
+                if (isset($itemsParsed['items'])) {
+                    $parsedSchema->items = $itemsParsed['items'];
+                }
                 // TODO: update this once TODO in mapResponses is addressed
                 $parsedSchema->isResponse = in_array("{$parsedSchema->items->type}[]", $this->responseSchemaTypes);
             }
@@ -214,7 +256,7 @@ class OpenApiParser implements Parser
                 parent: $parent,
             );
 
-            $parsedProperties = $this->parseSchemas($schema->properties, $parsedSchema);
+            $parsedProperties = $this->parseSchemas($schema->properties, $parsedSchema, $seen);
 
             // additionalProperties defaults to true according to OpenAPI spec, but it actually isn't
             // usually present. We're ignoring it unless it's explicitly set to a type definition, or
@@ -223,7 +265,7 @@ class OpenApiParser implements Parser
                 ($schema->type === Type::OBJECT && ! $schema->properties && $schema->additionalProperties)
                 || ! is_bool($schema->additionalProperties)
             ) {
-                $parsedSchema = $this->addAdditionalProperties($schema, $parsedSchema);
+                $parsedSchema = $this->addAdditionalProperties($schema, $parsedSchema, $seen);
             }
 
             $parsedSchema->properties = collect($parsedProperties)
@@ -250,7 +292,8 @@ class OpenApiParser implements Parser
     protected function parseAllOfSchema(
         OpenApiSchema $schema,
         ?Schema &$parent = null,
-        ?string $parentPropName = null
+        ?string $parentPropName = null,
+        array $seen = []
     ): Schema {
         $parsedSchema = new Schema(
             name: $schema->title,
@@ -263,7 +306,7 @@ class OpenApiParser implements Parser
         $allOf = collect($schema->allOf)
             ->mapWithKeys(fn ($s, $i) => ["{$schema->title} composite {$i}" => $s])
             ->toArray();
-        $parsedAllOf = $this->parseSchemas($allOf, $parsedSchema);
+        $parsedAllOf = $this->parseSchemas($allOf, $parsedSchema, $seen);
 
         // TODO: I feel like there's some neater way to handle allOf schemas using intersection types,
         // but I'm not sure how to do it
@@ -288,7 +331,7 @@ class OpenApiParser implements Parser
         return $parsedSchema;
     }
 
-    protected function addAdditionalProperties(OpenApiSchema $originalSchema, Schema $parsedSchema): Schema
+    protected function addAdditionalProperties(OpenApiSchema $originalSchema, Schema $parsedSchema, array $seen = []): Schema
     {
         $additionalProperties = $originalSchema->additionalProperties;
         $type = SimpleType::MIXED->value;
@@ -299,8 +342,12 @@ class OpenApiParser implements Parser
             ) {
                 $type = $this->mapSchemaTypeToPhpType($additionalProperties->type, $additionalProperties->format);
             } else {
-                $additionalPropertiesItemSchema = $this->parseSchema($additionalProperties, $parsedSchema);
-                $type = $additionalPropertiesItemSchema->type;
+                // Route through parseSchemas so cycle detection happens before object creation
+                $aps = $this->parseSchemas(['ap' => $additionalProperties], $parsedSchema, $seen);
+                if (isset($aps['ap'])) {
+                    $additionalPropertiesItemSchema = $aps['ap'];
+                    $type = $additionalPropertiesItemSchema->type;
+                }
             }
         }
 
