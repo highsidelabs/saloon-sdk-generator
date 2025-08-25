@@ -21,6 +21,7 @@ use Nette\PhpGenerator\Literal;
 use Nette\PhpGenerator\Method;
 use Nette\PhpGenerator\PhpFile;
 use Saloon\Contracts\Body\HasBody;
+use Saloon\Data\MultipartValue;
 use Saloon\Enums\Method as SaloonHttpMethod;
 use Saloon\Http\Request;
 use Saloon\Http\Response;
@@ -88,6 +89,7 @@ class RequestGenerator extends BaseRequestGenerator
             } elseif ($contentType === 'multipart/form-data') {
                 $classType->addTrait(HasMultipartBody::class);
                 $namespace->addUse(HasMultipartBody::class);
+                $namespace->addUse(MultipartValue::class);
             } elseif ($contentType === 'text/xml') {
                 $classType->addTrait(HasXmlBody::class);
                 $namespace->addUse(HasXmlBody::class);
@@ -233,11 +235,28 @@ class RequestGenerator extends BaseRequestGenerator
         if ($endpoint->bodySchema) {
             $returnValText = $this->generateDefaultBody($endpoint->bodySchema);
 
-            $methods['defaultBody'] = $classType->addMethod('defaultBody')
-                ->setReturnType('array')
-                ->addBody(
+            $defaultBodyMethod = $classType->addMethod('defaultBody')
+                ->setReturnType('array');
+
+            if ($endpoint->bodySchema->contentType === 'multipart/form-data') {
+                $defaultBodyMethod
+                    ->addBody('$data = ' . sprintf($returnValText, NameHelper::safeVariableName($endpoint->bodySchema->name)) . ';')
+                    ->addBody('$multipart = [];')
+                    ->addBody('foreach ($data as $key => $value) {')
+                    ->addBody('    if (is_string($value) || is_numeric($value)) {')
+                    ->addBody('        $multipart[] = new MultipartValue($key, (string) $value);')
+                    ->addBody('    } else {')
+                    ->addBody('        $multipart[] = new MultipartValue($key, json_encode($value));')
+                    ->addBody('    }')
+                    ->addBody('}')
+                    ->addBody('return $multipart;');
+            } else {
+                $defaultBodyMethod->addBody(
                     sprintf("return {$returnValText};", NameHelper::safeVariableName($endpoint->bodySchema->name))
                 );
+            }
+
+            $methods['defaultBody'] = $defaultBodyMethod;
 
             $safeName = NameHelper::requestClassName($endpoint->bodySchema->name);
             $bodyFQN = "{$this->config->dtoNamespace()}\\{$safeName}";
